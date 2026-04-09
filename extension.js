@@ -43,7 +43,7 @@ var pausedAutomatically = false; // keep track of the timer state between the sc
 
 const Indicator = GObject.registerClass(class Indicator extends PanelMenu.Button {
     _init() {
-        super._init(0.0, 'Toggle Button');
+        super._init(0.0, 'Toggle Button', true); // dontCreateMenu = true
 
         this.timer = new Timer.Timer();
 
@@ -68,26 +68,96 @@ const Indicator = GObject.registerClass(class Indicator extends PanelMenu.Button
     }
 
     _setupInput() {
-        // handle mouse and touch click
-        this._clickGesture = new Clutter.ClickGesture();
-        this._clickGesture.connect('recognize', (action) => {
-            const button = action.get_button();
-            if (button === 3) { // Secondary
+        this._longPressTimeout = null;
+        this._isLongPress = false;
+
+        // Use event signals directly instead of Clutter.ClickGesture/LongPressGesture.
+        // In GNOME 50, PanelMenu.Button has its own Clutter.ClickGesture
+        // that conflicts with additional gesture actions on the same actor.
+        // Event signals work at a lower level and avoid the conflict entirely.
+
+        // --- Mouse input ---
+        this._pressSignalId = this.connect('button-press-event', (actor, event) => {
+            const button = event.get_button();
+            this._isLongPress = false;
+
+            if (button === 1) {
+                this._startLongPressTimer();
+            }
+
+            return Clutter.EVENT_STOP;
+        });
+
+        this._releaseSignalId = this.connect('button-release-event', (actor, event) => {
+            const button = event.get_button();
+
+            this._cancelLongPressTimer();
+
+            if (this._isLongPress) {
+                this._isLongPress = false;
+                return Clutter.EVENT_STOP;
+            }
+
+            if (button === 3) { // Right click => reset
                 this._reset();
-            } else if (button === 1 || button === 0) { // Primary
+            } else if (button === 1) { // Left click => toggle
                 this._toggleTimer();
             }
-            return Clutter.EVENT_STOP;
-        });
-        this.add_action(this._clickGesture);
 
-        // handle long press (touch)
-        this._longPress = new Clutter.LongPressGesture();
-        this._longPress.connect('recognize', () => {
-            this._reset();
             return Clutter.EVENT_STOP;
         });
-        this.add_action(this._longPress);
+
+        // --- Touch input (tablet/touchscreen support) ---
+        this._touchSignalId = this.connect('touch-event', (actor, event) => {
+            const type = event.type();
+
+            if (type === Clutter.EventType.TOUCH_BEGIN) {
+                this._isLongPress = false;
+                this._startLongPressTimer();
+                return Clutter.EVENT_STOP;
+            }
+
+            if (type === Clutter.EventType.TOUCH_END) {
+                this._cancelLongPressTimer();
+
+                if (this._isLongPress) {
+                    this._isLongPress = false;
+                    return Clutter.EVENT_STOP;
+                }
+
+                this._toggleTimer();
+                return Clutter.EVENT_STOP;
+            }
+
+            // Cancel long press if finger moves away (TOUCH_UPDATE)
+            if (type === Clutter.EventType.TOUCH_CANCEL) {
+                this._cancelLongPressTimer();
+                this._isLongPress = false;
+                return Clutter.EVENT_STOP;
+            }
+
+            return Clutter.EVENT_PROPAGATE;
+        });
+    }
+
+    _startLongPressTimer() {
+        this._cancelLongPressTimer();
+        this._longPressTimeout = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            600, // long press threshold in ms
+            () => {
+                this._isLongPress = true;
+                this._reset();
+                this._longPressTimeout = null;
+                return GLib.SOURCE_REMOVE;
+            });
+    }
+
+    _cancelLongPressTimer() {
+        if (this._longPressTimeout) {
+            GLib.source_remove(this._longPressTimeout);
+            this._longPressTimeout = null;
+        }
     }
 
     _toggleTimer() {
@@ -158,9 +228,25 @@ const Indicator = GObject.registerClass(class Indicator extends PanelMenu.Button
             this.timeout = null;
         }
 
-        // Remove gestures
-        this.remove_action(this._clickGesture);
-        this.remove_action(this._longPress);
+        // Cancel long-press timeout if pending
+        if (this._longPressTimeout) {
+            GLib.source_remove(this._longPressTimeout);
+            this._longPressTimeout = null;
+        }
+
+        // Disconnect event signals
+        if (this._pressSignalId) {
+            this.disconnect(this._pressSignalId);
+            this._pressSignalId = null;
+        }
+        if (this._releaseSignalId) {
+            this.disconnect(this._releaseSignalId);
+            this._releaseSignalId = null;
+        }
+        if (this._touchSignalId) {
+            this.disconnect(this._touchSignalId);
+            this._touchSignalId = null;
+        }
 
         this._label.destroy();
         this._label = null;
